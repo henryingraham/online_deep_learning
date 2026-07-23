@@ -102,21 +102,31 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        self.down1 = ConvBlock(in_channels, 32, stride=2)
-        self.down2 = ConvBlock(32, 64, stride=2)
-        self.down3 = ConvBlock(64, 128, stride=2)
+        # Full-res stem + U-Net skips help recover thin lane boundaries
+        self.stem = ConvBlock(in_channels, 32, stride=1)
+        self.down1 = ConvBlock(32, 64, stride=2)
+        self.down2 = ConvBlock(64, 128, stride=2)
+        self.down3 = ConvBlock(128, 256, stride=2)
 
-        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.up_conv2 = ConvBlock(128, 64, stride=1)
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.up_conv2 = ConvBlock(256, 128, stride=1)
 
-        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.up_conv1 = ConvBlock(64, 32, stride=1)
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.up_conv1 = ConvBlock(128, 64, stride=1)
 
-        self.up0 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)
-        self.up_conv0 = ConvBlock(32, 32, stride=1)
+        self.up0 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.up_conv0 = ConvBlock(64, 32, stride=1)
 
-        self.seg_head = nn.Conv2d(32, num_classes, kernel_size=1)
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=1),
+        )
         self.depth_head = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1),
             nn.Sigmoid(),
         )
@@ -136,7 +146,8 @@ class Detector(torch.nn.Module):
         """
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        d1 = self.down1(z)
+        s0 = self.stem(z)
+        d1 = self.down1(s0)
         d2 = self.down2(d1)
         d3 = self.down3(d2)
 
@@ -147,7 +158,7 @@ class Detector(torch.nn.Module):
         u1 = self.up_conv1(torch.cat([u1, d1], dim=1))
 
         u0 = self.up0(u1)
-        u0 = self.up_conv0(u0)
+        u0 = self.up_conv0(torch.cat([u0, s0], dim=1))
 
         logits = self.seg_head(u0)
         depth = self.depth_head(u0).squeeze(1)

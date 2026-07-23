@@ -13,12 +13,29 @@ from .models import load_model, save_model
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def dice_loss(logits: torch.Tensor, targets: torch.Tensor, num_classes: int = 3) -> torch.Tensor:
+    """Soft Dice over lane classes (1, 2); background ignored."""
+    probs = F.softmax(logits, dim=1)
+    targets_oh = F.one_hot(targets, num_classes).permute(0, 3, 1, 2).float()
+
+    # only lane boundaries matter for IoU
+    probs = probs[:, 1:]
+    targets_oh = targets_oh[:, 1:]
+
+    dims = (0, 2, 3)
+    intersection = (probs * targets_oh).sum(dims)
+    cardinality = probs.sum(dims) + targets_oh.sum(dims)
+    dice = (2 * intersection + 1e-5) / (cardinality + 1e-5)
+    return 1.0 - dice.mean()
+
+
 def train(
     exp_dir: str = "logs",
-    num_epoch: int = 20,
+    num_epoch: int = 30,
     lr: float = 1e-3,
     batch_size: int = 32,
-    depth_weight: float = 5.0,
+    depth_weight: float = 1.0,
+    dice_weight: float = 1.0,
     seed: int = 2024,
 ):
     if torch.cuda.is_available():
@@ -53,8 +70,8 @@ def train(
         shuffle=False,
     )
 
-    # emphasize rare lane-boundary classes
-    class_weights = torch.tensor([0.2, 2.0, 2.0], device=device)
+    # strong emphasis on rare left/right boundary pixels
+    class_weights = torch.tensor([0.1, 4.0, 4.0], device=device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
@@ -74,9 +91,10 @@ def train(
             optimizer.zero_grad()
             logits, pred_depth = model(image)
 
-            seg_loss = F.cross_entropy(logits, track, weight=class_weights)
+            ce_loss = F.cross_entropy(logits, track, weight=class_weights)
+            d_loss = dice_loss(logits, track)
             depth_loss = F.l1_loss(pred_depth, depth)
-            loss = seg_loss + depth_weight * depth_loss
+            loss = ce_loss + dice_weight * d_loss + depth_weight * depth_loss
 
             loss.backward()
             optimizer.step()
@@ -115,9 +133,10 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_dir", type=str, default="logs")
-    parser.add_argument("--num_epoch", type=int, default=20)
+    parser.add_argument("--num_epoch", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--depth_weight", type=float, default=5.0)
+    parser.add_argument("--depth_weight", type=float, default=1.0)
+    parser.add_argument("--dice_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=2024)
     train(**vars(parser.parse_args()))
